@@ -1,0 +1,20 @@
+# Rede pequena - 6 nós, topologia em cadeia com algumas conexões extras
+num_nodes: 6
+min_neighbors: 1
+max_neighbors: 4
+
+resources:
+  n1: "r1, r2"
+  n2: "r3"
+  n3: "r4, r5"
+  n4: "r6"
+  n5: "r7, r8"
+  n6: "r9"
+
+edges:
+  - "n1, n2"
+  - "n1, n3"
+  - "n2, n4"
+  - "n3, n5"
+  - "n4, n6"
+  - "n5, n6"
