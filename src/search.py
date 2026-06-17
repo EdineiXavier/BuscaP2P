@@ -132,7 +132,43 @@ def flooding(network: "P2PNetwork", start_id: str, resource_id: str, ttl: int) -
             result.found    = True
             result.found_at = found_node
             result.path     = found_path
-            result.messages += 1  # resposta de volta
+            result.messages += 1  # resposta de volta ao origem
+
+            # — COMPORTAMENTO REAL P2P —
+            # O nó que encontrou para de propagar (não enfileira seus filhos).
+            # Os demais nós da mesma rodada NÃO sabem que o recurso foi achado
+            # e continuam propagando normalmente até o TTL zerar.
+            # Retiramos da fila apenas os filhos diretos do found_node.
+            camada_paralela = [(n, t, pai, path) for n, t, pai, path in proxima
+                               if pai != found_node]
+
+            while camada_paralela:
+                msgs_paralela  = []
+                proxima_par    = []
+                ttl_par        = camada_paralela[0][1]
+
+                for n, t, pai, path in camada_paralela:
+                    if n in visited:
+                        continue
+                    visited.add(n)
+                    result.nodes_visited.add(n)
+                    result.messages += 1
+                    msgs_paralela.append(f"{pai} -> {n} (propagação paralela)")
+
+                    if t > 0:
+                        for viz in network.get_node(n).neighbors:
+                            if viz not in visited:
+                                proxima_par.append((viz, t - 1, n, path + [viz]))
+
+                if msgs_paralela:
+                    result.historico.append(HistoricoStep(
+                        rodada=rodada, ttl_restante=ttl_par,
+                        mensagens=msgs_paralela
+                    ))
+                    rodada += 1
+
+                camada_paralela = proxima_par
+
             _propagate_cache(network, found_path, resource_id, found_node)
             return result
 
@@ -142,12 +178,21 @@ def flooding(network: "P2PNetwork", start_id: str, resource_id: str, ttl: int) -
 
 
 # -----------------------------------------------------------------------
-# Random Walk — sequencial, com backtracking
+# Random Walk — sem revisitar (backtracking grátis quando sem vizinhos novos)
+#
+# Regras:
+#   1. Só escolhe vizinhos ainda não visitados (sem revisitar).
+#   2. Se não houver vizinhos não visitados, volta pelo caminho (backtracking)
+#      sem consumir TTL, até encontrar um nó com vizinhos não visitados.
+#   3. Cada avanço para um nó novo consome 1 TTL e conta 1 mensagem.
+#   4. O backtracking não consome TTL nem conta mensagem.
 # -----------------------------------------------------------------------
 
 def random_walk(network: "P2PNetwork", start_id: str, resource_id: str, ttl: int) -> SearchResult:
     result     = SearchResult()
     current_id = start_id
+    visited    = {start_id}
+    stack      = [start_id]   # pilha para backtracking
     result.nodes_visited.add(current_id)
     result.path.append(current_id)
 
@@ -162,33 +207,50 @@ def random_walk(network: "P2PNetwork", start_id: str, resource_id: str, ttl: int
     rodada        = 1
 
     while remaining_ttl > 0:
-        neighbors = network.get_node(current_id).neighbors
-        if not neighbors:
-            break
+        node      = network.get_node(current_id)
+        # Vizinhos ainda não visitados
+        novos = [v for v in node.neighbors if v not in visited]
 
-        next_id = random.choice(neighbors)
-        result.messages   += 1
-        result.nodes_visited.add(next_id)
-        result.path.append(next_id)
-        remaining_ttl -= 1
-
-        encontrou = network.get_node(next_id).has_resource(resource_id)
-        result.historico.append(HistoricoStep(
-            rodada=rodada, ttl_restante=remaining_ttl,
-            mensagens=[f"{current_id} -> {next_id}"],
-            encontrou=encontrou,
-            found_at=next_id if encontrou else None
-        ))
-        rodada += 1
-
-        if encontrou:
-            result.found    = True
-            result.found_at = next_id
+        if novos:
+            # Avança para um vizinho novo aleatório — consome TTL
+            next_id = random.choice(novos)
+            visited.add(next_id)
+            stack.append(next_id)
             result.messages += 1
-            _propagate_cache(network, result.path, resource_id, next_id)
-            return result
+            result.nodes_visited.add(next_id)
+            result.path.append(next_id)
+            remaining_ttl -= 1
 
-        current_id = next_id
+            encontrou = network.get_node(next_id).has_resource(resource_id)
+            result.historico.append(HistoricoStep(
+                rodada=rodada, ttl_restante=remaining_ttl,
+                mensagens=[f"{current_id} -> {next_id}"],
+                encontrou=encontrou,
+                found_at=next_id if encontrou else None
+            ))
+            rodada += 1
+
+            if encontrou:
+                result.found    = True
+                result.found_at = next_id
+                result.messages += 1
+                _propagate_cache(network, result.path, resource_id, next_id)
+                return result
+
+            current_id = next_id
+
+        else:
+            # Sem vizinhos novos — backtracking grátis (sem TTL, sem mensagem)
+            stack.pop()
+            if not stack:
+                break   # voltou à origem sem encontrar
+            prev_id    = stack[-1]
+            result.historico.append(HistoricoStep(
+                rodada=rodada, ttl_restante=remaining_ttl,
+                mensagens=[f"{current_id} <- {prev_id} (backtrack, sem custo)"]
+            ))
+            rodada += 1
+            current_id = prev_id
 
     return result
 
@@ -211,7 +273,7 @@ def informed_flooding(network: "P2PNetwork", start_id: str, resource_id: str, tt
         return result
 
     cached = start_node.get_cached_location(resource_id)
-    if cached:
+    if cached and cached in start_node.neighbors:
         result.found     = True
         result.found_at  = cached
         result.cache_hit = True
@@ -246,7 +308,7 @@ def informed_flooding(network: "P2PNetwork", start_id: str, resource_id: str, tt
             node = network.get_node(current_id)
 
             c = node.get_cached_location(resource_id)
-            if c:
+            if c and c in node.neighbors:
                 msgs_rodada.append(f"{pai} -> {current_id} -> {c} (cache hit!)")
                 result.nodes_visited.add(c)
                 encontrou  = True
@@ -308,7 +370,7 @@ def informed_random_walk(network: "P2PNetwork", start_id: str, resource_id: str,
         return result
 
     cached = node.get_cached_location(resource_id)
-    if cached:
+    if cached and cached in node.neighbors:
         result.found     = True
         result.found_at  = cached
         result.cache_hit = True
@@ -321,6 +383,8 @@ def informed_random_walk(network: "P2PNetwork", start_id: str, resource_id: str,
 
     remaining_ttl = ttl
     rodada        = 1
+    visited_irw   = {current_id}
+    stack_irw     = [current_id]
 
     while remaining_ttl > 0:
         node      = network.get_node(current_id)
@@ -329,7 +393,7 @@ def informed_random_walk(network: "P2PNetwork", start_id: str, resource_id: str,
             break
 
         cached = node.get_cached_location(resource_id)
-        if cached:
+        if cached and cached in node.neighbors:
             result.found     = True
             result.found_at  = cached
             result.cache_hit = True
@@ -341,29 +405,48 @@ def informed_random_walk(network: "P2PNetwork", start_id: str, resource_id: str,
             _propagate_cache(network, result.path, resource_id, cached)
             return result
 
-        next_id = random.choice(neighbors)
-        result.messages   += 1
-        result.nodes_visited.add(next_id)
-        result.path.append(next_id)
-        remaining_ttl -= 1
+        # Vizinhos não visitados
+        novos = [v for v in neighbors if v not in visited_irw]
 
-        encontrou = network.get_node(next_id).has_resource(resource_id)
-        result.historico.append(HistoricoStep(
-            rodada=rodada, ttl_restante=remaining_ttl,
-            mensagens=[f"{current_id} -> {next_id}"],
-            encontrou=encontrou,
-            found_at=next_id if encontrou else None
-        ))
-        rodada += 1
-
-        if encontrou:
-            result.found    = True
-            result.found_at = next_id
+        if novos:
+            next_id = random.choice(novos)
+            visited_irw.add(next_id)
+            stack_irw.append(next_id)
             result.messages += 1
-            _propagate_cache(network, result.path, resource_id, next_id)
-            return result
+            result.nodes_visited.add(next_id)
+            result.path.append(next_id)
+            remaining_ttl -= 1
 
-        current_id = next_id
+            encontrou = network.get_node(next_id).has_resource(resource_id)
+            result.historico.append(HistoricoStep(
+                rodada=rodada, ttl_restante=remaining_ttl,
+                mensagens=[f"{current_id} -> {next_id}"],
+                encontrou=encontrou,
+                found_at=next_id if encontrou else None
+            ))
+            rodada += 1
+
+            if encontrou:
+                result.found    = True
+                result.found_at = next_id
+                result.messages += 1
+                _propagate_cache(network, result.path, resource_id, next_id)
+                return result
+
+            current_id = next_id
+
+        else:
+            # Backtracking grátis
+            stack_irw.pop()
+            if not stack_irw:
+                break
+            prev_id = stack_irw[-1]
+            result.historico.append(HistoricoStep(
+                rodada=rodada, ttl_restante=remaining_ttl,
+                mensagens=[f"{current_id} <- {prev_id} (backtrack, sem custo)"]
+            ))
+            rodada += 1
+            current_id = prev_id
 
     return result
 

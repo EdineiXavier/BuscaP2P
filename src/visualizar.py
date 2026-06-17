@@ -1,7 +1,15 @@
+#!/usr/bin/env python3
+"""
+visualizar.py - Visualização interativa da busca em redes P2P
+
+Uso:
+    python src/visualizar.py configs/rede_pequena.yaml
+    python src/visualizar.py configs/rede_media.yaml --velocidade 1.2
+"""
+
 import sys
 import os
 import argparse
-from collections import deque
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -12,7 +20,8 @@ import networkx as nx
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from network import P2PNetwork
-from search import flooding, random_walk, informed_flooding, informed_random_walk
+from search import (flooding, random_walk, informed_flooding,
+                    informed_random_walk, SearchResult)
 
 ALGORITMOS = {
     "flooding":             flooding,
@@ -46,109 +55,48 @@ def montar_grafo(network: P2PNetwork):
     return G
 
 # -----------------------------------------------------------------------
-# Coleta passos do flooding — por CAMADA (paralelo real)
+# Converte o histórico do SearchResult em passos visuais
+#
+# Cada passo visual é uma tupla:
+#   (nos_visitados: set, arestas_ativas: list, encontrou: bool, found_node: str|None)
 # -----------------------------------------------------------------------
 
-def coletar_passos_flooding(network, start_id, resource_id, ttl, informada):
-    passos     = []
-    visitados  = {start_id}
-    start_node = network.get_node(start_id)
+def passos_do_historico(result: SearchResult, start_id: str):
+    """
+    Deriva os passos de animação diretamente do histórico do SearchResult,
+    garantindo que a visualização seja 100% fiel ao que o algoritmo fez.
+    """
+    passos       = []
+    nos_visitados = {start_id}
 
-    if start_node.has_resource(resource_id):
-        passos.append((set([start_id]), [], True, start_id))
-        return passos
+    for step in result.historico:
+        arestas_ativas = []
 
-    if informada:
-        cached = start_node.get_cached_location(resource_id)
-        if cached:
-            passos.append(({start_id, cached}, [(start_id, cached)], True, cached))
-            return passos
+        for msg in step.mensagens:
+            # Extrai os nós da mensagem — formato: "nX -> nY" ou "nX <- nY (backtrack...)"
+            if " -> " in msg:
+                partes = msg.split(" -> ")
+                origem = partes[0].strip()
+                # pode ter sufixo "(cache hit!)" no último trecho
+                destino = partes[-1].strip().split(" ")[0]
+                nos_visitados.add(origem)
+                nos_visitados.add(destino)
+                arestas_ativas.append((origem, destino))
+            elif " <- " in msg:
+                # backtrack: "nX <- nY" significa voltou de nX para nY
+                partes = msg.split(" <- ")
+                origem  = partes[0].strip()
+                destino = partes[1].strip().split(" ")[0]
+                nos_visitados.add(origem)
+                nos_visitados.add(destino)
+                arestas_ativas.append((origem, destino))
 
-    camada_atual = [(viz, ttl - 1, start_id) for viz in start_node.neighbors]
-
-    while camada_atual:
-        proxima_camada = []
-        arestas_camada = []
-        encontrou      = False
-        found_node     = None
-
-        for current_id, current_ttl, pai in camada_atual:
-            if current_id in visitados:
-                continue
-
-            visitados.add(current_id)
-            arestas_camada.append((pai, current_id))
-            node = network.get_node(current_id)
-
-            if informada:
-                cached = node.get_cached_location(resource_id)
-                if cached:
-                    passos.append((set(visitados) | {cached},
-                                   arestas_camada + [(current_id, cached)],
-                                   True, cached))
-                    return passos
-
-            if node.has_resource(resource_id):
-                encontrou  = True
-                found_node = current_id
-
-            if current_ttl > 0:
-                for viz in node.neighbors:
-                    if viz not in visitados:
-                        proxima_camada.append((viz, current_ttl - 1, current_id))
-
-        passos.append((set(visitados), arestas_camada, encontrou, found_node))
-
-        if encontrou:
-            return passos
-
-        camada_atual = proxima_camada
-
-    return passos
-
-# -----------------------------------------------------------------------
-# Coleta passos do random walk (sequencial por natureza)
-# -----------------------------------------------------------------------
-
-def coletar_passos_random_walk(network, start_id, resource_id, ttl, informada):
-    import random
-    passos     = []
-    current_id = start_id
-    visitados  = {start_id}
-    node       = network.get_node(current_id)
-
-    if node.has_resource(resource_id):
-        passos.append(({start_id}, [], True, start_id))
-        return passos
-
-    if informada:
-        cached = node.get_cached_location(resource_id)
-        if cached:
-            passos.append(({start_id, cached}, [(start_id, cached)], True, cached))
-            return passos
-
-    for _ in range(ttl):
-        node      = network.get_node(current_id)
-        neighbors = node.neighbors
-        if not neighbors:
-            break
-
-        if informada:
-            cached = node.get_cached_location(resource_id)
-            if cached:
-                passos.append((set(visitados) | {cached},
-                               [(current_id, cached)], True, cached))
-                return passos
-
-        next_id = random.choice(neighbors)
-        visitados.add(next_id)
-        passos.append((set(visitados), [(current_id, next_id)], False, None))
-
-        if network.get_node(next_id).has_resource(resource_id):
-            passos[-1] = (set(visitados), [(current_id, next_id)], True, next_id)
-            return passos
-
-        current_id = next_id
+        passos.append((
+            set(nos_visitados),
+            arestas_ativas,
+            step.encontrou,
+            step.found_at
+        ))
 
     return passos
 
@@ -299,18 +247,14 @@ def modo_interativo(network: P2PNetwork, velocidade: float):
             print("\nEncerrando.")
             break
 
-        # --- Coleta passos para animação ---
-        informada = algo.startswith("informed_")
-        if "flooding" in algo:
-            passos     = coletar_passos_flooding(network, node_id, resource_id, ttl, informada)
-            tipo_label = "paralelo por camada"
-        else:
-            passos     = coletar_passos_random_walk(network, node_id, resource_id, ttl, informada)
-            tipo_label = "sequencial"
-
-        # --- Roda também o algoritmo real para pegar o SearchResult completo ---
+        # --- Roda o algoritmo UMA única vez ---
         fn     = ALGORITMOS[algo]
         result = fn(network, node_id, resource_id, ttl)
+
+        # --- Deriva os passos visuais do histórico real ---
+        passos     = passos_do_historico(result, node_id)
+        is_flooding = "flooding" in algo
+        tipo_label  = "paralelo por camada" if is_flooding else "sequencial"
 
         atualizar_status(
             f"Iniciando: {algo} | origem={node_id} | recurso={resource_id} | TTL={ttl}"
@@ -326,10 +270,11 @@ def modo_interativo(network: P2PNetwork, velocidade: float):
         fig.canvas.draw()
         plt.pause(velocidade * 1.5)
 
-        # --- Animação ---
-        nos_vis   = set()
-        encontrou = False
+        # --- Animação passo a passo ---
+        nos_vis    = set()
+        encontrou  = False
         found_node = None
+
         for i, (nos_vis, arestas, encontrou, found_node) in enumerate(passos):
             desenhar_rede_base(ax, G, pos, network,
                                start_id=node_id,
@@ -339,32 +284,38 @@ def modo_interativo(network: P2PNetwork, velocidade: float):
                                found_node=found_node,
                                modo='busca')
 
-            rodada_label = "Rodada" if "flooding" in algo else "Passo"
+            rodada_label = "Rodada" if is_flooding else "Passo"
+            step         = result.historico[i]
+            msg_titulo   = " | ".join(step.mensagens)
+
             ax.set_title(
                 f"Algoritmo: {algo.upper()}  |  Origem: {node_id}  |  "
                 f"Recurso: {resource_id}  |  TTL: {ttl}\n"
-                f"{rodada_label} {i + 1}/{len(passos)}"
-                + (f"  — {len(arestas)} mensagem(ns) simultânea(s)" if "flooding" in algo else ""),
-                fontsize=11, fontweight='bold'
+                f"{rodada_label} {i + 1}/{len(passos)} — {msg_titulo}",
+                fontsize=10, fontweight='bold'
             )
 
-            if encontrou:
+            ja_encontrou = result.found and encontrou
+
+            if ja_encontrou and "propagação paralela" not in " ".join(result.historico[i].mensagens):
                 msg = (f"✔  ENCONTRADO em '{found_node}'  |  "
-                       f"Msgs: {result.messages}  |  Nós visitados: {len(nos_vis)}")
+                       f"Propagação paralela em andamento...  |  Nós visitados: {len(nos_vis)}")
             elif i == len(passos) - 1:
-                msg = (f"✘  NÃO ENCONTRADO (TTL esgotado)  |  "
+                status_final = f"✔  ENCONTRADO em '{result.found_at}'" if result.found else "✘  NÃO ENCONTRADO"
+                msg = (f"{status_final}  |  "
                        f"Msgs: {result.messages}  |  Nós visitados: {len(nos_vis)}")
+            elif encontrou:
+                msg = (f"✔  ENCONTRADO em '{found_node}'  |  "
+                       f"Outros nós ainda propagando...  |  Nós visitados: {len(nos_vis)}")
             else:
                 msg = (f"Propagando...  |  "
                        f"{rodada_label}: {i + 1}  |  Nós visitados: {len(nos_vis)}")
 
             atualizar_status(msg)
             plt.pause(velocidade)
+            # Não para ao encontrar — continua mostrando propagação paralela
 
-            if encontrou:
-                break
-
-        # --- Resultado no terminal (igual ao main.py) ---
+        # --- Resultado no terminal ---
         sep()
         print(f"\n  [Busca: {algo.upper()} | nó={node_id} | recurso={resource_id} | TTL={ttl}]")
         print(result.summary())
