@@ -189,10 +189,18 @@ def flooding(network: "P2PNetwork", start_id: str, resource_id: str, ttl: int) -
 # -----------------------------------------------------------------------
 
 def random_walk(network: "P2PNetwork", start_id: str, resource_id: str, ttl: int) -> SearchResult:
+    """
+    Random Walk com backtracking completo:
+    - Avança para vizinhos não visitados aleatoriamente (consome TTL).
+    - Se não há vizinhos novos: backtrack grátis (sem TTL).
+    - Se TTL chega a 0: backtrack recuperando +1 TTL, e tenta vizinhos
+      não visitados do nó anterior. Repete até achar ou esgotar
+      todas as possibilidades alcançáveis com o TTL dado.
+    """
     result     = SearchResult()
     current_id = start_id
     visited    = {start_id}
-    stack      = [start_id]   # pilha para backtracking
+    stack      = [start_id]
     result.nodes_visited.add(current_id)
     result.path.append(current_id)
 
@@ -206,13 +214,12 @@ def random_walk(network: "P2PNetwork", start_id: str, resource_id: str, ttl: int
     remaining_ttl = ttl
     rodada        = 1
 
-    while remaining_ttl > 0:
-        node      = network.get_node(current_id)
-        # Vizinhos ainda não visitados
+    while True:
+        node  = network.get_node(current_id)
         novos = [v for v in node.neighbors if v not in visited]
 
-        if novos:
-            # Avança para um vizinho novo aleatório — consome TTL
+        if novos and remaining_ttl > 0:
+            # Avança para um vizinho novo aleatório — consome 1 TTL
             next_id = random.choice(novos)
             visited.add(next_id)
             stack.append(next_id)
@@ -240,14 +247,17 @@ def random_walk(network: "P2PNetwork", start_id: str, resource_id: str, ttl: int
             current_id = next_id
 
         else:
-            # Sem vizinhos novos — backtracking grátis (sem TTL, sem mensagem)
+            # Sem vizinhos novos OU TTL zerou — backtrack recuperando +1 TTL
             stack.pop()
             if not stack:
-                break   # voltou à origem sem encontrar
-            prev_id    = stack[-1]
+                break   # voltou à origem sem encontrar nada
+            prev_id = stack[-1]
+            # Recupera 1 TTL ao voltar (só recupera se havia gasto para chegar aqui)
+            if remaining_ttl < ttl:
+                remaining_ttl += 1
             result.historico.append(HistoricoStep(
                 rodada=rodada, ttl_restante=remaining_ttl,
-                mensagens=[f"{current_id} <- {prev_id} (backtrack, sem custo)"]
+                mensagens=[f"{current_id} <- {prev_id} (backtrack, TTL+1={remaining_ttl})"]
             ))
             rodada += 1
             current_id = prev_id
